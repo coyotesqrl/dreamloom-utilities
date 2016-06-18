@@ -21,25 +21,26 @@ import java.io.InputStream;
 import java.io.UncheckedIOException;
 import java.util.List;
 import java.util.Set;
-import java.util.concurrent.BrokenBarrierException;
-import java.util.concurrent.CyclicBarrier;
+import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.Phaser;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
 /**
  * Creates a multiplexed input stream, capable of parallel, concurrent reads by multiple consumers.
- *
+ * <p>
  * Input streams are depleted as they are consumed; this decorator allows multiple consumers to read
  * from the same stream without making multiple copies and overfilling memory. Because it operates
  * in parallel, it also provides the performance benefit of concurrent stream reading without adding
  * complexity to client code.
- *
+ * <p>
  * If any of the {@code Consumer} threads throw an exception or take longer than the configured time
  * to read a chunk of data from memory ({@link #AWAIT_SECONDS} seconds), the multiplexer will fail
  * all the consumer threads.
@@ -56,15 +57,19 @@ public class MultiplexInputStream extends InputStream {
         }
     };
 
+    private static final String MULTIPLEX_THREAD_PREFIX = "Multiplex";
+
     private final BufferedInputStream bis;
 
     private final byte[] buffer;
 
-    private CyclicBarrier barrier;
+    private Phaser phaser;
 
     private int currentReadBytes;
 
     private ExecutorService service;
+
+    private final AtomicInteger factoryIdx = new AtomicInteger(0);
 
     /**
      * Creates a new {@code MultiplexInputStream} instance with an in-memory buffer of default
@@ -81,7 +86,7 @@ public class MultiplexInputStream extends InputStream {
      * Creates a new {@code MultiplexInputStream} instance with an in-memory buffer of
      * {@code bufferSize)} bytes.
      *
-     * @param source the underlying input stream to decorate and multiplex
+     * @param source     the underlying input stream to decorate and multiplex
      * @param bufferSize the size of the in-memory buffer
      * @throws IOException if there is a problem reading the underlying stream
      */
@@ -98,7 +103,7 @@ public class MultiplexInputStream extends InputStream {
 
     /**
      * Starts the multiplexer, running the list of provided {@code Consumer}s to read the stream.
-     *
+     * <p>
      * It is the responsibility of the caller to ensure that each of the provided {@code Consumer}s
      * correctly ingests and consumes the {@code InputStream} and does not block.
      *
@@ -108,20 +113,29 @@ public class MultiplexInputStream extends InputStream {
      */
     public void invoke(List<Consumer<InputStream>> consumers)
             throws ExecutionException, InterruptedException {
-        barrier = new CyclicBarrier(consumers.size(), () -> {
-            try {
-                currentReadBytes = bis.read(buffer);
-            } catch (IOException e) {
-                // Failure to read the underlying stream should result in a failure of all running
-                // consumer threads.
-                throw new UncheckedIOException(e);
-            }
-        });
+        phaser = new Phaser(consumers.size()) {
+            @Override
+            protected boolean onAdvance(int phase, int registeredParties) {
+                if (registeredParties == 0) {
+                    return true;
+                }
+                try {
+                    currentReadBytes = bis.read(buffer);
+                } catch (IOException e) {
+                    // Failure to read the underlying stream should result in a failure of all running
+                    // consumer threads.
+                    throw new UncheckedIOException(e);
+                }
 
-        service = Executors.newFixedThreadPool(consumers.size());
+                return false;
+            }
+        };
+
+        service = Executors.newFixedThreadPool(consumers.size(),
+                r -> new Thread(r, getConsumerThreadName()));
 
         Set<Future> futures = consumers.stream()
-                .map(function -> service.submit(() -> function.accept(MultiplexInputStream.this)))
+                .map(consumer -> service.submit(() -> consumer.accept(MultiplexInputStream.this)))
                 .collect(Collectors.toSet());
 
         for (Future future : futures) {
@@ -135,11 +149,11 @@ public class MultiplexInputStream extends InputStream {
         // Block if this thread has gotten the last byte of the current buffer
         if (index == currentReadBytes) {
             try {
-                barrier.await(AWAIT_SECONDS, TimeUnit.SECONDS);
+                phaser.awaitAdvanceInterruptibly(phaser.arrive(), AWAIT_SECONDS, TimeUnit.SECONDS);
 
                 index = 0;
                 INDEX.set(index);
-            } catch (InterruptedException | BrokenBarrierException | TimeoutException e) {
+            } catch (InterruptedException | TimeoutException e) {
                 throw new IOException("Error processing multiplexed input", e);
             }
         }
@@ -155,7 +169,23 @@ public class MultiplexInputStream extends InputStream {
 
     @Override
     public void close() throws IOException {
-        super.close();
-        service.shutdownNow();
+        // If caller is one of the consumer threads, arriveAndDeregister on its behalf;
+        // else, close down resources
+        synchronized (MULTIPLEX_THREAD_PREFIX) {
+            if (Thread.currentThread()
+                    .getName()
+                    .startsWith(MULTIPLEX_THREAD_PREFIX)) {
+                phaser.arriveAndDeregister();
+            } else {
+                bis.close();
+                service.shutdownNow();
+            }
+        }
+    }
+
+    private String getConsumerThreadName() {
+        return String.format("%s-%d-%s", MULTIPLEX_THREAD_PREFIX, factoryIdx.getAndIncrement(),
+                UUID.randomUUID()
+                        .toString());
     }
 }
