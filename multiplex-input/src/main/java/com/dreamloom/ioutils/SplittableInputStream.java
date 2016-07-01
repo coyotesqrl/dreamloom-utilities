@@ -13,7 +13,7 @@
     You should have received a copy of the GNU Lesser General Public License
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
-package com.dreamloom.multiplex;
+package com.dreamloom.ioutils;
 
 import java.io.BufferedInputStream;
 import java.io.IOException;
@@ -30,11 +30,13 @@ import java.util.concurrent.Phaser;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
 /**
- * Creates a multiplexed input stream, capable of parallel, concurrent reads by multiple consumers.
+ * Creates a splittable input stream, capable of parallel, concurrent reads by multiple consumers.
  * <p>
  * Input streams are depleted as they are consumed; this decorator allows multiple consumers to read
  * from the same stream without making multiple copies and overfilling memory. Because it operates
@@ -42,13 +44,12 @@ import java.util.stream.Collectors;
  * complexity to client code.
  * <p>
  * If any of the {@code Consumer} threads throw an exception or take longer than the configured time
- * to read a chunk of data from memory ({@link #AWAIT_SECONDS} seconds), the multiplexer will fail
- * all the consumer threads.
+ * to read a chunk of data from memory, all the consumer threads will fail.
  */
-public class MultiplexInputStream extends InputStream {
-    private static final int DEFAULT_BUFFER_SIZE = 2048;
+public class SplittableInputStream extends InputStream {
+    private static final int DEFAULT_BUFFER_SIZE = 4096;
 
-    private static final int AWAIT_SECONDS = 10;
+    private static final int DEFAULT_AWAIT = 10;
 
     private static final ThreadLocal<Integer> INDEX = new ThreadLocal<Integer>() {
         @Override
@@ -59,50 +60,64 @@ public class MultiplexInputStream extends InputStream {
 
     private static final String MULTIPLEX_THREAD_PREFIX = "Multiplex";
 
+    private final Lock lock = new ReentrantLock(true);
+
     private final BufferedInputStream bis;
 
     private final byte[] buffer;
 
+    private final int waitSeconds;
+
     private Phaser phaser;
 
-    private int currentReadBytes;
+    private volatile int currentReadBytes;
 
     private ExecutorService service;
 
     private final AtomicInteger factoryIdx = new AtomicInteger(0);
 
     /**
-     * Creates a new {@code MultiplexInputStream} instance with an in-memory buffer of default
-     * size, 2048 bytes.
+     * Creates a new {@code SplittableInputStream} instance with an in-memory buffer
+     * {@link #DEFAULT_BUFFER_SIZE} bytes and a timeout of {@link #DEFAULT_AWAIT} seconds.
      *
-     * @param source the underlying input stream to decorate and multiplex
+     * @param source the underlying input stream to decorate and split
      * @throws IOException if there is a problem reading the underlying stream
      */
-    public MultiplexInputStream(InputStream source) throws IOException {
+    public SplittableInputStream(InputStream source) throws IOException {
         this(source, DEFAULT_BUFFER_SIZE);
     }
 
     /**
-     * Creates a new {@code MultiplexInputStream} instance with an in-memory buffer of
-     * {@code bufferSize)} bytes.
+     * Creates a new {@code SplittableInputStream} instance with an in-memory buffer of
+     * {@code bufferSize)} bytes and a timeout of {@link #DEFAULT_AWAIT} seconds.
      *
-     * @param source     the underlying input stream to decorate and multiplex
+     * @param source     the underlying input stream to decorate and split
      * @param bufferSize the size of the in-memory buffer
      * @throws IOException if there is a problem reading the underlying stream
      */
-    public MultiplexInputStream(InputStream source, int bufferSize) throws IOException {
-        buffer = new byte[bufferSize];
-        bis = new BufferedInputStream(source);
-
-        currentReadBytes = bis.read(buffer);
-        if (currentReadBytes == -1) {
-            throw new IllegalStateException(
-                    "Error initializing stream; no content found in source.");
-        }
+    public SplittableInputStream(InputStream source, int bufferSize) throws IOException {
+        this(source, bufferSize, DEFAULT_AWAIT);
     }
 
     /**
-     * Starts the multiplexer, running the list of provided {@code Consumer}s to read the stream.
+     * Creates a new {@code SplittableInputStream} instance with an in-memory buffer of
+     * {@code bufferSize)} bytes and a timeout of {@code waitSeconds} seconds.
+     *
+     * @param source      the underlying input stream to decorate and split
+     * @param bufferSize  the size of the in-memory buffer
+     * @param waitSeconds the number of seconds to allow any consumer to block processing before the
+     *                    entire batch fails
+     * @throws IOException if there is a problem reading the underlying stream
+     */
+    public SplittableInputStream(InputStream source, int bufferSize, int waitSeconds)
+            throws IOException {
+        buffer = new byte[bufferSize];
+        bis = new BufferedInputStream(source);
+        this.waitSeconds = waitSeconds;
+    }
+
+    /**
+     * Starts the stream, running the list of provided {@code Consumer}s to read the stream.
      * <p>
      * It is the responsibility of the caller to ensure that each of the provided {@code Consumer}s
      * correctly ingests and consumes the {@code InputStream} and does not block.
@@ -113,7 +128,7 @@ public class MultiplexInputStream extends InputStream {
      */
     public void invoke(List<Consumer<InputStream>> consumers)
             throws ExecutionException, InterruptedException {
-        phaser = new Phaser(consumers.size()) {
+        phaser = new Phaser() {
             @Override
             protected boolean onAdvance(int phase, int registeredParties) {
                 if (registeredParties == 0) {
@@ -121,23 +136,30 @@ public class MultiplexInputStream extends InputStream {
                 }
                 try {
                     currentReadBytes = bis.read(buffer);
+                    return false;
                 } catch (IOException e) {
                     // Failure to read the underlying stream should result in a failure of all running
                     // consumer threads.
                     throw new UncheckedIOException(e);
                 }
-
-                return false;
             }
         };
+
+        // Register main thread
+        phaser.register();
 
         service = Executors.newFixedThreadPool(consumers.size(),
                 r -> new Thread(r, getConsumerThreadName()));
 
         Set<Future> futures = consumers.stream()
-                .map(consumer -> service.submit(() -> consumer.accept(MultiplexInputStream.this)))
+                .map(consumer -> service.submit(() -> {
+                    phaser.register();
+                    consumer.accept(SplittableInputStream.this);
+                }))
                 .collect(Collectors.toSet());
 
+        // Main thread now deregisters and lets the others engage with the phaser
+        phaser.arriveAndDeregister();
         for (Future future : futures) {
             future.get();
         }
@@ -145,25 +167,34 @@ public class MultiplexInputStream extends InputStream {
 
     @Override
     public int read() throws IOException {
-        Integer index = INDEX.get();
-        // Block if this thread has gotten the last byte of the current buffer
-        if (index == currentReadBytes) {
-            try {
-                phaser.awaitAdvanceInterruptibly(phaser.arrive(), AWAIT_SECONDS, TimeUnit.SECONDS);
-
-                index = 0;
-                INDEX.set(index);
-            } catch (InterruptedException | TimeoutException e) {
-                throw new IOException("Error processing multiplexed input", e);
-            }
-        }
-
-        if (currentReadBytes == -1) {
+        if (phaser.isTerminated()) {
             return -1;
         }
 
+        if (currentReadBytes == -1) {
+            phaser.arriveAndDeregister();
+            return -1;
+        }
+
+        if (currentReadBytes == 0) {
+            awaitInterruptibly(null);
+        }
+
+        Integer index = INDEX.get();
         byte b = buffer[index++];
         INDEX.set(index);
+
+        if (b == -1) {
+            phaser.arriveAndDeregister();
+            return -1;
+        }
+
+        // Block if this thread has gotten the last byte of the current buffer
+        // or if we have not read any bytes yet
+        if (index == currentReadBytes) {
+            awaitInterruptibly(() -> INDEX.set(0));
+        }
+
         return b;
     }
 
@@ -171,7 +202,8 @@ public class MultiplexInputStream extends InputStream {
     public void close() throws IOException {
         // If caller is one of the consumer threads, arriveAndDeregister on its behalf;
         // else, close down resources
-        synchronized (MULTIPLEX_THREAD_PREFIX) {
+        lock.lock();
+        try {
             if (Thread.currentThread()
                     .getName()
                     .startsWith(MULTIPLEX_THREAD_PREFIX)) {
@@ -180,12 +212,33 @@ public class MultiplexInputStream extends InputStream {
                 bis.close();
                 service.shutdownNow();
             }
+        } finally {
+            lock.unlock();
         }
     }
 
     private String getConsumerThreadName() {
-        return String.format("%s-%d-%s", MULTIPLEX_THREAD_PREFIX, factoryIdx.getAndIncrement(),
+        return String.format("%s-%d-%s",
+                MULTIPLEX_THREAD_PREFIX,
+                factoryIdx.getAndIncrement(),
                 UUID.randomUUID()
                         .toString());
+    }
+
+    private void awaitInterruptibly(Runnable postwaitTask) throws RuntimeException {
+        try {
+            if (waitSeconds > 0) {
+                phaser.awaitAdvanceInterruptibly(phaser.arrive(), DEFAULT_AWAIT, TimeUnit.SECONDS);
+            } else {
+                phaser.awaitAdvanceInterruptibly(phaser.arrive());
+            }
+
+            if (postwaitTask != null) {
+                postwaitTask.run();
+            }
+        } catch (InterruptedException | TimeoutException e) {
+            phaser.forceTermination();
+            throw new RuntimeException("Error processing split input", e);
+        }
     }
 }
