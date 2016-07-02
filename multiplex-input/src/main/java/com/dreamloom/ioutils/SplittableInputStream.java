@@ -22,6 +22,8 @@ import java.io.UncheckedIOException;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentSkipListSet;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -76,6 +78,8 @@ public class SplittableInputStream extends InputStream {
 
     private final AtomicInteger factoryIdx = new AtomicInteger(0);
 
+    private final ConcurrentSkipListSet<String> closedConsumers = new ConcurrentSkipListSet<>();
+
     /**
      * Creates a new {@code SplittableInputStream} instance with an in-memory buffer
      * {@link #DEFAULT_BUFFER_SIZE} bytes and a timeout of {@link #DEFAULT_AWAIT} seconds.
@@ -128,7 +132,8 @@ public class SplittableInputStream extends InputStream {
      */
     public void invoke(List<Consumer<InputStream>> consumers)
             throws ExecutionException, InterruptedException {
-        phaser = new Phaser() {
+        // Register main thread to prevent phaser from advancing too soon
+        phaser = new Phaser(1) {
             @Override
             protected boolean onAdvance(int phase, int registeredParties) {
                 if (registeredParties == 0) {
@@ -145,21 +150,24 @@ public class SplittableInputStream extends InputStream {
             }
         };
 
-        // Register main thread
-        phaser.register();
-
         service = Executors.newFixedThreadPool(consumers.size(),
                 r -> new Thread(r, getConsumerThreadName()));
 
+        CountDownLatch countDownLatch = new CountDownLatch(consumers.size());
         Set<Future> futures = consumers.stream()
                 .map(consumer -> service.submit(() -> {
                     phaser.register();
+                    countDownLatch.countDown();
                     consumer.accept(SplittableInputStream.this);
                 }))
                 .collect(Collectors.toSet());
 
+        // Don't release phaser lock until all consumer threads have registered
+        // with the phaser
+        countDownLatch.await();
         // Main thread now deregisters and lets the others engage with the phaser
         phaser.arriveAndDeregister();
+
         for (Future future : futures) {
             future.get();
         }
@@ -167,12 +175,9 @@ public class SplittableInputStream extends InputStream {
 
     @Override
     public int read() throws IOException {
-        if (phaser.isTerminated()) {
-            return -1;
-        }
-
-        if (currentReadBytes == -1) {
-            phaser.arriveAndDeregister();
+        if (phaser.isTerminated() || currentReadBytes == -1
+                || closedConsumers.contains(Thread.currentThread()
+                .getName())) {
             return -1;
         }
 
@@ -208,6 +213,8 @@ public class SplittableInputStream extends InputStream {
                     .getName()
                     .startsWith(MULTIPLEX_THREAD_PREFIX)) {
                 phaser.arriveAndDeregister();
+                closedConsumers.add(Thread.currentThread()
+                        .getName());
             } else {
                 bis.close();
                 service.shutdownNow();
